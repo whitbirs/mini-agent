@@ -6,8 +6,9 @@
 //   - tools/list       : 列出可用工具
 //   - tools/call       : 执行工具调用
 //
-// 目前只实现了一个工具 read_file，方便先跑通整条链路；
-// 想加新工具时，只需要在 toolRegistry 里注册一个新的 ToolHandler。
+// 本文件只负责协议层（JSON-RPC 解析/序列化、stdio 读写、超时控制）；
+// 工具的具体实现（read_file、run_shell 等）在 tool 包里，
+// 想加新工具时去 tool 包里加，不需要改这个文件。
 package main
 
 import (
@@ -19,6 +20,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"mini-agent/mcpserver/sandbox"
+	"mini-agent/mcpserver/tool"
 )
 
 // ---------- JSON-RPC 2.0 基础结构 ----------
@@ -42,32 +46,13 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
-// ---------- MCP 工具定义 ----------
+// toolTimeout 是单次工具执行允许的最长时间，超过就中断并返回错误。
+// 注意：容器模式下 "docker run" 本身也有几秒的启动开销，10s 大部分情况够用，
+// 如果以后发现容器模式经常超时，可以考虑给两种模式设不同的 timeout。
+const toolTimeout = 10 * time.Second
 
-// Tool 描述一个工具的 schema（对应 tools/list 返回的内容）。
-type Tool struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	InputSchema InputSchema `json:"inputSchema"`
-}
-
-type InputSchema struct {
-	Type       string                 `json:"type"`
-	Properties map[string]interface{} `json:"properties"`
-	Required   []string               `json:"required"`
-}
-
-// ToolHandler 是工具的实际执行逻辑。入参是 tools/call 传来的 arguments，
-// 以及一个带超时的 context——工具实现里如果发起了可取消的操作（比如
-// exec.CommandContext 跑 shell、或者 http 请求），要把这个 ctx 传下去，
-// 这样超时到了就能真正中断，而不只是 caller 端不再等待。
-type ToolHandler func(ctx context.Context, args map[string]interface{}) (string, error)
-
-// sandboxRoot 限制 read_file 只能读这个目录下的文件——最基本的沙箱。
-// 由调用方（agent）通过命令行参数指定要暴露哪个目录，而不是写死成
-// mcpserver 自己所在的位置：mcpserver 应该是无状态的工具服务，
-// "该给它看哪些文件"这个决策权在调用方手里，不该跟这个二进制文件本身绑死。
-var sandboxRoot = mustSandboxRoot()
+// registry 持有所有已注册工具，在 main() 里根据命令行参数和环境变量初始化。
+var registry *tool.Registry
 
 func mustSandboxRoot() string {
 	if len(os.Args) > 1 {
@@ -83,71 +68,26 @@ func mustSandboxRoot() string {
 	return wd
 }
 
-var toolRegistry = map[string]Tool{
-	"read_file": {
-		Name:        "read_file",
-		Description: "读取沙箱目录下某个文本文件的内容",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]interface{}{
-				"path": map[string]interface{}{
-					"type":        "string",
-					"description": "相对于沙箱根目录的文件路径",
-				},
-			},
-			Required: []string{"path"},
-		},
-	},
-}
-
-// toolTimeout 是单次工具执行允许的最长时间，超过就中断并返回错误。
-const toolTimeout = 10 * time.Second
-
-var toolHandlers = map[string]ToolHandler{
-	"read_file": handleReadFile,
-}
-
-func handleReadFile(ctx context.Context, args map[string]interface{}) (string, error) {
-	rel, ok := args["path"].(string)
-	if !ok || rel == "" {
-		return "", fmt.Errorf("缺少参数 path")
-	}
-
-	// 沙箱校验：拼出绝对路径后必须仍然落在 sandboxRoot 内，防止 ../.. 逃逸。
-	full := filepath.Join(sandboxRoot, rel)
-	full = filepath.Clean(full)
-	if !strings.HasPrefix(full, filepath.Clean(sandboxRoot)+string(os.PathSeparator)) && full != sandboxRoot {
-		return "", fmt.Errorf("拒绝访问沙箱之外的路径: %s", rel)
-	}
-
-	// os.ReadFile 本身不支持 context 取消，所以用一个 goroutine + select
-	// 包一层：ctx 超时了就直接返回错误给上层，不再等文件系统操作完成。
-	// 对本地小文件这几乎不会触发，但换成网络文件系统或超大文件时就有意义了，
-	// 也是未来加 run_shell 这类工具时的标准写法（那边可以直接用 exec.CommandContext）。
-	type result struct {
-		data []byte
-		err  error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		data, err := os.ReadFile(full)
-		ch <- result{data, err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return "", fmt.Errorf("读取文件超时: %s", rel)
-	case r := <-ch:
-		if r.err != nil {
-			return "", fmt.Errorf("读取文件失败: %w", r.err)
-		}
-		return string(r.data), nil
-	}
-}
-
 // ---------- 主循环：从 stdin 读一行 JSON-RPC 请求，处理后写一行响应到 stdout ----------
 
 func main() {
+	sandboxRoot := mustSandboxRoot()
+	registry = tool.NewRegistry(sandboxRoot)
+
+	// MCP_SANDBOX_MODE=docker 时启用容器沙箱，run_shell 会在隔离容器里执行。
+	// 不设置这个环境变量时保持原来的本地执行行为，向后兼容。
+	if os.Getenv("MCP_SANDBOX_MODE") == "docker" {
+		docker := sandbox.NewDockerExecutor(
+			"alpine:3.20", // 体积小、自带 busybox，覆盖白名单里的 ls/cat/grep/find/wc/pwd
+			256,           // 内存上限 256MB
+			"0.5",         // CPU 上限 0.5 核
+			sandboxRoot,
+			"/workspace",
+		)
+		registry.UseDocker(docker)
+		fmt.Fprintln(os.Stderr, "[mcpserver] Docker 沙箱模式已启用，镜像:", docker.Image)
+	}
+
 	reader := bufio.NewReader(os.Stdin)
 	writer := bufio.NewWriter(os.Stdout)
 	defer writer.Flush()
@@ -195,14 +135,10 @@ func handleRequest(req rpcRequest) rpcResponse {
 		}
 
 	case "tools/list":
-		tools := make([]Tool, 0, len(toolRegistry))
-		for _, t := range toolRegistry {
-			tools = append(tools, t)
-		}
 		return rpcResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
-			Result:  map[string]interface{}{"tools": tools},
+			Result:  map[string]interface{}{"tools": registry.List()},
 		}
 
 	case "tools/call":
@@ -214,17 +150,15 @@ func handleRequest(req rpcRequest) rpcResponse {
 			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid params"}}
 		}
 
-		handler, ok := toolHandlers[params.Name]
-		if !ok {
+		if !registry.Exists(params.Name) {
 			return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32601, Message: "unknown tool: " + params.Name}}
 		}
 
-		// 每次工具执行都套一个超时，防止某个工具卡死整个 server（尤其是
-		// 未来加了 run_shell 这种可能挂起的工具时，这层保护就很关键）。
+		// 每次工具执行都套一个超时，防止某个工具卡死整个 server。
 		ctx, cancel := context.WithTimeout(context.Background(), toolTimeout)
 		defer cancel()
 
-		text, err := handler(ctx, params.Arguments)
+		text, err := registry.Call(ctx, params.Name, params.Arguments)
 		isError := err != nil
 		if err != nil {
 			text = err.Error()
